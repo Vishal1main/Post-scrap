@@ -1,59 +1,95 @@
-const TelegramBot = require("node-telegram-bot-api");
-const axios = require("axios");
-const cheerio = require("cheerio");
+require('dotenv').config();
+const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
+const cheerio = require('cheerio');
+const express = require('express');
 
-const bot = new TelegramBot("YOUR_BOT_TOKEN", { polling: true });
+const TOKEN = process.env.BOT_TOKEN;
+const URL = process.env.RENDER_EXTERNAL_URL; // e.g. https://your-bot.onrender.com
 
-bot.on("message", async (msg) => {
-  const chatId = msg.chat.id;
-  const url = msg.text.trim();
+const bot = new TelegramBot(TOKEN, { webHook: { port: process.env.PORT || 3000 } });
+bot.setWebHook(`${URL}/bot${TOKEN}`);
 
-  if (!url.startsWith("http")) {
-    return bot.sendMessage(chatId, "Send a valid movie post URL.");
-  }
+const app = express();
+app.use(express.json());
+app.post(`/bot${TOKEN}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
 
+app.get('/', (req, res) => res.send('Bot is running'));
+
+// STEP-WISE SCRAPER FUNCTION
+async function extractFinalDownloadLink(startUrl) {
   try {
-    bot.sendMessage(chatId, "🔍 Processing...");
+    // Step 1: Initial page (like filmyfly.loan)
+    const res1 = await axios.get(startUrl);
+    const $1 = cheerio.load(res1.data);
+    const nextUrl = $1('.dlbtn a').attr('href');
 
-    // Step 1 ➜ Step 2
-    const res1 = await axios.get(url);
-    const $ = cheerio.load(res1.data);
-    const step2 = $('a.d1').attr("href");
+    if (!nextUrl) throw new Error('No linkmake.in found');
 
-    // Step 2 ➜ Step 3
-    const res2 = await axios.get(step2);
+    // Step 2: Linkmake.in page
+    const res2 = await axios.get(nextUrl);
     const $2 = cheerio.load(res2.data);
-    const step3 = $2(".dl a").first().attr("href"); // Pick 480p for example
+    const filesdlUrl = $2('.dlink a').eq(0).attr('href');
 
-    // Step 3 ➜ Step 4
-    const res3 = await axios.get(step3);
+    if (!filesdlUrl) throw new Error('No filesdl link found');
+
+    // Step 3: filesdl.in cloud page → get "Login To Download - GDFLIX"
+    const res3 = await axios.get(filesdlUrl);
     const $3 = cheerio.load(res3.data);
-    const step4 = $3('a.button1[href*="gdflix"]').attr("href");
+    const gdflixLink = $3('a.button1[href*="gdflix"]').attr('href');
 
-    // Step 4 ➜ Step 5 (redirect)
-    const res4 = await axios.get(step4, { maxRedirects: 5 });
-    const step5 = res4.request.res.responseUrl;
+    if (!gdflixLink) throw new Error('No GDFLIX link found');
 
-    // Step 5 ➜ Step 6
-    const res5 = await axios.get(step5);
+    // Step 4: Redirection page to gdflix.dad
+    const res4 = await axios.get(gdflixLink);
+    const redirectScript = res4.data.match(/location\.replace'([^']+)/);
+    if (!redirectScript) throw new Error('No redirect URL from GDFLIX');
+
+    const gdflixFinal = redirectScript[1];
+
+    // Step 5: gdflix.dad page → get "Instant DL [10GBPS]" button
+    const res5 = await axios.get(gdflixFinal);
     const $5 = cheerio.load(res5.data);
-    const step6 = $5('a.btn-danger[href*="instant"]').attr("href");
+    const instantDL = $5('a.btn-danger[href*="instant"]').attr('href');
 
-    // Step 6 ➜ Step 7
-    const res6 = await axios.get(step6);
+    if (!instantDL) throw new Error('No instant.busycdn link');
+
+    // Step 6: Instant page → extract download URL from final script
+    const res6 = await axios.get(instantDL);
     const $6 = cheerio.load(res6.data);
-    const js = res6.data;
-    const finalUrlMatch = js.match(/getQueryParam'url';.*?return urlParams.get'url';/s);
-    const finalUrl = new URL(step6).searchParams.get("url");
-
-    if (finalUrl) {
-      bot.sendMessage(chatId, `✅ Final Download Link:\n\n${finalUrl}`);
-    } else {
-      bot.sendMessage(chatId, "❌ Could not extract final download link.");
+    const finalScript = res6.data.match(/getQueryParam'url';[\s\S]*?href = downloadUrl;/);
+    const finalUrlMatch = res6.data.match(/oneclick-dl\.pages\.dev\/\?url=([^'"]+)/);
+    if (finalUrlMatch) {
+      return `https://oneclick-dl.pages.dev/?url=${finalUrlMatch[1]}`;
     }
 
-  } catch (err) {
-    console.error(err.message);
-    bot.sendMessage(chatId, "❌ Error occurred while processing the link.");
+    return '✅ Reached final page but could not extract final URL';
+  } catch (e) {
+    console.error(e);
+    return `❌ Error: ${e.message}`;
   }
+}
+
+// BOT LOGIC
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(msg.chat.id, `👋 Send me a movie post link to extract final download link.`);
+});
+
+bot.on('message', async (msg) => {
+  const text = msg.text;
+  const chatId = msg.chat.id;
+
+  if (!text.startsWith('http')) return;
+
+  bot.sendMessage(chatId, '🔍 Scraping download link, please wait...');
+
+  const finalLink = await extractFinalDownloadLink(text);
+  bot.sendMessage(chatId, `🎯 Final Download Link:\n${finalLink}`);
+});
+
+app.listen(process.env.PORT || 3000, () => {
+  console.log('Server running...');
 });
